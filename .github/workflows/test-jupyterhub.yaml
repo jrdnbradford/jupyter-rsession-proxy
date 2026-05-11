@@ -1,6 +1,5 @@
-# This GitHub workflow installs RStudio Server alongside JupyterLab
-# and verifies the /rstudio/ proxy endpoint is reachable.
-name: Test
+# Installs RStudio Server inside a JupyterHub user server and verifies the /rstudio/ proxy endpoint is reachable.
+name: Test JupyterHub
 
 on:
   pull_request:
@@ -18,58 +17,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  test-proxy:
-    runs-on: ubuntu-latest
-    container:
-      image: quay.io/jupyter/r-notebook:latest
-      options: --user root
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install package
-        run: pip install -e .
-
-      - name: Install RStudio Server
-        run: |
-          apt-get update -qq
-          apt-get install -y --no-install-recommends gdebi-core jq wget
-
-          RELEASE=$(. /etc/os-release && echo "$VERSION_CODENAME")
-          RSTUDIO_URL=$(wget --output-document - --output-file /dev/null \
-            'https://www.rstudio.com/wp-content/downloads.json' \
-            | jq --raw-output --arg RELEASE "$RELEASE" \
-              '.rstudio.open_source.stable.server.installer[$RELEASE].url')
-
-          wget --no-verbose --output-document rstudio-server-latest-amd64.deb "$RSTUDIO_URL"
-          gdebi --non-interactive rstudio-server-latest-amd64.deb
-          rm rstudio-server-latest-amd64.deb
-
-      - name: Start JupyterLab
-        run: |
-          jupyter lab --no-browser --ServerApp.token='' --ServerApp.password='' --allow-root &
-          timeout 60 bash -c 'until curl -sf http://localhost:8888/api; do sleep 1; done'
-
-      - name: Test Proxy
-        run: |
-          # Use a cookie jar so curl accumulates auth cookies across redirects.
-          HTTP_CODE=$(curl -s --max-time 60 \
-            -c /tmp/rstudio_cookies.txt -b /tmp/rstudio_cookies.txt \
-            -L --max-redirs 5 \
-            -w "%{http_code}" -o /tmp/rstudio_response.html \
-            http://localhost:8888/rstudio/)
-          echo "HTTP response code: $HTTP_CODE"
-
-          if [[ "$HTTP_CODE" != 2* ]]; then
-            echo "--- Response body ---"
-            cat /tmp/rstudio_response.html
-            exit 1
-          fi
-
-          grep -qi "rstudio" /tmp/rstudio_response.html \
-            || { echo "Response does not contain RStudio content"; cat /tmp/rstudio_response.html; exit 1; }
-          echo "RStudio is reachable and served IDE content"
-
   test-jupyterhub:
     runs-on: ubuntu-latest
     container:
@@ -110,7 +57,8 @@ jobs:
           cat > /tmp/jupyterhub_config.py << 'EOF'
           c.JupyterHub.authenticator_class = 'dummy'
           c.DummyAuthenticator.password = 'password'
-          c.JupyterHub.spawner_class = 'local'
+          c.JupyterHub.spawner_class = 'jupyterhub.spawner.LocalProcessSpawner'
+          c.Spawner.cmd = ['/opt/conda/bin/jupyterhub-singleuser']
           c.Authenticator.admin_users = {'admin'}
           c.JupyterHub.api_tokens = {'ci-admin-token': 'admin'}
           EOF
@@ -128,12 +76,16 @@ jobs:
           curl -sf -X POST -H "Authorization: token $ADMIN_TOKEN" $BASE/users/testuser
           curl -sf -X POST -H "Authorization: token $ADMIN_TOKEN" $BASE/users/testuser/server
 
-          timeout 120 bash -c '
-            until curl -sf -H "Authorization: token '"$ADMIN_TOKEN"'" \
+          i=0
+          while [ $i -lt 60 ]; do
+            READY=$(curl -sf -H "Authorization: token $ADMIN_TOKEN" \
               http://localhost:8000/hub/api/users/testuser \
-              | jq -e ".servers.default.ready == true" > /dev/null 2>&1; do
-              sleep 2
-            done'
+              | jq -r '.servers[""].ready // false')
+            [ "$READY" = "true" ] && break
+            i=$((i + 1))
+            sleep 2
+          done
+          [ "$READY" = "true" ] || { echo "Timed out waiting for user server to start"; exit 1; }
 
           USER_TOKEN=$(curl -sf -X POST \
             -H "Authorization: token $ADMIN_TOKEN" \
@@ -151,11 +103,14 @@ jobs:
             http://localhost:8000/user/testuser/rstudio/)
           echo "HTTP response code: $HTTP_CODE"
 
-          if [[ "$HTTP_CODE" != 2* ]]; then
-            echo "--- Response body ---"
-            cat /tmp/hub_rstudio_response.html
-            exit 1
-          fi
+          case "$HTTP_CODE" in
+            2*) ;;
+            *)
+              echo "--- Response body ---"
+              cat /tmp/hub_rstudio_response.html
+              exit 1
+              ;;
+          esac
 
           grep -qi "rstudio" /tmp/hub_rstudio_response.html \
             || { echo "Response does not contain RStudio content"; cat /tmp/hub_rstudio_response.html; exit 1; }
